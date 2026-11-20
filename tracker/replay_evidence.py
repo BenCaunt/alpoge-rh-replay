@@ -47,6 +47,31 @@ def checkout_info(project):
     return identity(version, revision, expected['inputs_manifest_sha256']), launcher, env
 
 
+REPLAY_FILE = 'kernel-replay.json'
+
+
+def missing_targets(directory, targets):
+    names = {r['module'] for r in targets}
+    log = (directory / 'build.log').read_text(errors='replace')
+    built = set(tasks.rebuilt_imports(log, names, set()))
+    return [r for r in targets if r['module'] not in built]
+
+
+def replay_command(missing):
+    return ['lake', 'env', 'leanchecker', '--verbose', *[r['module'] for r in missing]]
+
+
+def check_replay(record, directory, missing):
+    require(record['receipt_sha256'] == tasks.digest(directory / 'receipt.json'),
+            'Kernel replay belongs to a different receipt')
+    require(record['command'] == replay_command(missing) and type(record['exit_code']) is int
+            and record['exit_code'] == 0, 'Invalid kernel replay command or exit code')
+    require(isinstance(record['transcript'], str), 'Invalid kernel replay transcript')
+    lines = set(record['transcript'].splitlines())
+    for row in missing:
+        require('replaying ' + row['module'] in lines, 'Missing kernel replay line: ' + row['module'])
+
+
 def verify(directory, targets, project_rows, checkout=None):
     """Hash members in place. Bundle verification never extracts files."""
     receipt = json.loads((directory / 'receipt.json').read_text())
@@ -98,7 +123,12 @@ def verify(directory, targets, project_rows, checkout=None):
                     'Source mismatch: ' + name)
         for path, digest in objects.items():
             require(tasks.digest(checkout / '.lake/build' / path) == digest, 'Installed object mismatch: ' + path)
-    return dict(identity=platform, tasks=ids, producer_lake_seconds=receipt.get('elapsed_seconds'), built_targets=sorted(built.intersection(names)),
+    missing = [r for r in targets if r['module'] not in built]
+    if missing:
+        path = directory / REPLAY_FILE
+        require(path.is_file(), 'Missing per-target kernel replay for cached targets')
+        check_replay(json.loads(path.read_text()), directory, missing)
+    return dict(identity=platform, tasks=ids, kernel_replayed_targets=[r['module'] for r in missing], producer_lake_seconds=receipt.get('elapsed_seconds'), built_targets=sorted(built.intersection(names)),
                 rebuilt_project_modules=rebuilt)
 
 

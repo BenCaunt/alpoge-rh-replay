@@ -40,7 +40,8 @@ def plan(assignments, rows):
 
 
 class DockerBuilder:
-    def __init__(self, args, directory):
+    def __init__(self, args, directory, selected):
+        self.selected = selected
         self.container = args.container
         self.tracker = PurePosixPath(args.container_repo) / 'tracker/worker_build.py'
         self.checkout = args.checkout
@@ -58,7 +59,8 @@ class DockerBuilder:
     def __call__(self, target, number):
         remote = self.root / f'{target}-{number}'
         local = self.directory / str(number)
-        if local.exists():
+        if local.exists() and ((local / evidence.REPLAY_FILE).is_file()
+                               or not evidence.missing_targets(local, self.selected[target])):
             return local
         command = ['docker', 'exec', self.container, 'python3', str(self.tracker),
                    'build', target, self.checkout, str(remote)]
@@ -69,11 +71,21 @@ class DockerBuilder:
         with tempfile.TemporaryDirectory(dir=self.directory) as tmp:
             stage = Path(tmp) / 'artifacts'
             stage.mkdir()
-            for name in FILES:
+            def fetch(name):
                 dest = stage / name
                 subprocess.run(['docker', 'cp', f'{self.container}:{remote}/{name}', str(dest)], check=True)
                 evidence.require(dest.is_file() and not dest.is_symlink(), 'Unexpected artifact: ' + name)
-            stage.rename(local)
+
+            if local.exists():
+                # Upgrade a pre-existing controller mirror after the builder has replayed its targets.
+                fetch(evidence.REPLAY_FILE)
+                (stage / evidence.REPLAY_FILE).replace(local / evidence.REPLAY_FILE)
+            else:
+                for name in FILES:
+                    fetch(name)
+                if evidence.missing_targets(stage, self.selected[target]):
+                    fetch(evidence.REPLAY_FILE)
+                stage.rename(local)
         return local
 
 
@@ -175,6 +187,8 @@ def dispatch(state, selected, rows, github, build, persist, jobs, poll, retry):
                         local = future.result()
                         result = evidence.verify(local, selected[target], rows)
                         files = [local / name for name in FILES]
+                        if result['kernel_replayed_targets']:
+                            files.append(local / evidence.REPLAY_FILE)
                         links = github.publish_assets(number, target, files)
                     except (ValueError, OSError, KeyError, subprocess.CalledProcessError) as exc:
                         entry['error'] = str(exc)
@@ -192,8 +206,10 @@ def dispatch(state, selected, rows, github, build, persist, jobs, poll, retry):
                     else:
                         receipt = json.loads(files[0].read_text())
                         body = (f"Replay submission\n\n{target}, Lake exit 0 on {result['identity']['platform']}. "
-                                f"{len(result['built_targets'])}/{len(result['tasks'])} requested targets "
-                                f"reported built in this transcript. Elapsed Lake time {receipt['elapsed_seconds']} s.\n\n"
+                                f"Of {len(result['tasks'])} requested targets, Lake built "
+                                f"{len(result['built_targets'])} and the kernel replayed "
+                                f"{len(result['kernel_replayed_targets'])} from cache. "
+                                f"Elapsed Lake time {receipt['elapsed_seconds']} s.\n\n"
                                 f"{links}\n\nBundle SHA-256 `{receipt['bundle_sha256']}`.\n\n{marker}")
                         entry['intent'] = 'submit'
                         persist()
@@ -237,7 +253,7 @@ def main():
         github = GitHub(args.fork)
         rows = {r['module']: r for r in tasks.load()}
         selected = plan(args.assignments, rows.values())
-        builder = DockerBuilder(args, directory)
+        builder = DockerBuilder(args, directory, selected)
         config = dict(owner=github.owner, fork=github.fork, container=args.container,
                       checkout=args.checkout, receipts=args.receipts, container_repo=args.container_repo,
                       assignments=list(selected), builder=builder.preflight())

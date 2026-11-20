@@ -201,6 +201,60 @@ class WorkerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Bundled object mismatch'):
                 evidence.verify(out, [row], rows)
 
+    def test_cached_footer_alone_cannot_be_published(self):
+        self.assignments.write_text('M000001')
+        out = self.artifacts('M000001', 1)
+        log = out / 'build.log'
+        log.write_text('All targets up-to-date (2 jobs).\n')
+        receipt = out / 'receipt.json'
+        record = json.loads(receipt.read_text())
+        record['log_sha256'] = tasks.digest(log)
+        receipt.write_text(json.dumps(record))
+        with patch.object(self.gh, 'publish_assets') as upload:
+            self.assertEqual(self.launch(self.artifacts), 1)
+            upload.assert_not_called()
+        self.assertEqual(self.gh.posts, [])
+        row = self.rows[0]
+        sidecar = dict(receipt_sha256=tasks.digest(receipt), command=evidence.replay_command([row]),
+                       exit_code=0, transcript='replaying Fixture.Mod00\n')
+        path = out / evidence.REPLAY_FILE
+        path.write_text(json.dumps(sidecar))
+        with self.assertRaisesRegex(ValueError, 'Missing kernel replay line'):
+            evidence.verify(out, [row], {row['module']: row})
+        sidecar.update(receipt_sha256='0'*64, transcript='replaying Fixture.Mod0\n')
+        path.write_text(json.dumps(sidecar))
+        with self.assertRaisesRegex(ValueError, 'different receipt'):
+            evidence.verify(out, [row], {row['module']: row})
+
+    def test_docker_builder_copies_cached_target_record_on_first_run_and_resume(self):
+        row = self.rows[0]
+        target = row['id']
+        remote = self.artifacts(target, 1)
+        (remote / 'build.log').write_text('All targets up-to-date (2 jobs).\n')
+        (remote / evidence.REPLAY_FILE).write_text('kernel record')
+        controller = self.root / 'controller'
+        controller.mkdir()
+        mirror = controller / '1'
+        args = Mock(container='fixture', container_repo='/repo', checkout='/project',
+                    receipts='/receipts', retry=[])
+        builder = worker.DockerBuilder(args, controller, {target: [row]})
+
+        def docker(cmd, **kwargs):
+            if cmd[1] == 'cp':
+                shutil.copyfile(remote / Path(cmd[2]).name, cmd[3])
+
+        with patch.object(subprocess, 'run', side_effect=docker) as run:
+            self.assertEqual(builder(target, 1), mirror)
+            self.assertEqual((mirror / evidence.REPLAY_FILE).read_text(), 'kernel record')
+            (mirror / evidence.REPLAY_FILE).unlink()
+            run.reset_mock()
+            self.assertEqual(builder(target, 1), mirror)
+            copied = [c.args[0][2] for c in run.call_args_list if c.args[0][1] == 'cp']
+            self.assertEqual(copied, [f'fixture:/receipts/{target}-1/{evidence.REPLAY_FILE}'])
+            run.reset_mock()
+            builder(target, 1)
+            run.assert_not_called()
+
     def test_warm_plans_disjoint_closures(self):
         rows = self.rows[:8]
         a, b, c, d, e, f, g, h = [r['id'] for r in rows]
@@ -267,6 +321,8 @@ class WorkerTests(unittest.TestCase):
                         'commit', '-qm', 'fixture', '--allow-empty'], check=True)
         self.summary['mathlib_commit'] = subprocess.check_output(['git', '-C', dep, 'rev-parse', 'HEAD'], text=True).strip()
         (self.tracker / 'summary.json').write_text(json.dumps(self.summary))
+        # A cache hit must produce reviewable evidence even after restarting publication.
+        self.assertEqual(tasks.run([self.rows[0]], self.project, self.root / 'prebuilt', False), 0)
         def build(target, number):
             out = self.root / str(number)
             if not (out / 'receipt.json').exists():
@@ -282,6 +338,15 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual((len(self.gh.issues), self.build_count, len(set(self.gh.posts)), len(self.gh.posts)),
                          (20, 20, 20, 20))
         self.assertEqual((self.root / '1/receipt.json').read_bytes(), first)
+        cached = self.root / '1'
+        self.assertEqual(evidence.missing_targets(cached, [self.rows[0]]), [self.rows[0]])
+        replay = json.loads((cached / evidence.REPLAY_FILE).read_text())
+        self.assertEqual(replay['receipt_sha256'], tasks.digest(cached / 'receipt.json'))
+        self.assertIn('replaying Fixture.Mod0', replay['transcript'].splitlines())
+        comment = self.gh.history[1][-1]['body']
+        self.assertIn(evidence.REPLAY_FILE, comment)
+        self.assertIn('Lake built 0 and the kernel replayed 1 from cache', comment)
+        self.assertFalse((self.root / '2' / evidence.REPLAY_FILE).exists())
         self.assertEqual(len(evidence.inventory(self.project, self.rows)['modules']), 20)
         argv = ['replay_evidence.py', 'reuse-check', 'M000001', str(self.root / '1'), '--checkout', str(self.project)]
         output = io.StringIO()
