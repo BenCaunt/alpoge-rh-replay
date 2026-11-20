@@ -148,6 +148,19 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual((len(self.gh.issues), self.build_count, self.gh.posts),
                          (20, 20, list(range(1, 21))))
 
+    def test_failed_open_grant_keeps_its_slot_until_released(self):
+        self.assignments.write_text('M000001 M000002')
+        def fail_first(target, number):
+            if number == 1:
+                raise ValueError('failed build')
+            return self.artifacts(target, number)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.launch(fail_first), 1)
+        self.assertEqual(len(self.gh.issues), 1)
+        self.gh.issues[1]['state'] = 'closed'
+        self.assertEqual(self.launch(fail_first), 1)
+        self.assertEqual(self.gh.posts, [2])
+
     def test_reconcile_lost_github_replies(self):
         self.assignments.write_text('M000001')
         for cut in ['claim', 'submit']:

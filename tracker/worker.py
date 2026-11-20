@@ -104,7 +104,18 @@ def dispatch(state, selected, rows, github, build, persist, jobs, poll, retry):
             pending = [t for t, e in entries.items() if not (e.get('submission') or e.get('error'))]
             if not pending:
                 return int(any(e.get('error') for e in entries.values()))
-            active = sum(bool(entries[t].get('issue') or entries[t].get('intent')) for t in pending)
+            # A failed build can still hold an open grant. It consumes capacity
+            # until the operator retries it or the issue is closed.
+            failed = [e for e in entries.values() if e.get('error')]
+            held = sum(1 for e in failed if not e.get('issue') and e.get('intent') == 'claim')
+            for issue in github.watch([e['issue'] for e in failed if e.get('issue')]):
+                if issue['state'] == 'open' and 'claim-conflict' not in {l['name'] for l in issue['labels']}:
+                    held += 1
+            outstanding = sum(bool(entries[t].get('issue') or entries[t].get('intent')) for t in pending)
+            if not outstanding and held >= jobs:
+                print('Failed reservations occupy all slots. Inspect the journal before resuming.', file=sys.stderr)
+                return 1
+            active = outstanding + held
             can_admit = active < jobs and any(not entries[t].get('issue') for t in pending)
             watch = [entries[t]['issue'] for t in pending if entries[t].get('issue')
                      and (t not in running or running[t].done())]
@@ -194,7 +205,7 @@ def dispatch(state, selected, rows, github, build, persist, jobs, poll, retry):
             if any(not (e.get('submission') or e.get('error')) for e in entries.values()):
                 remaining = [e for e in entries.values() if not (e.get('error') or e.get('submission'))]
                 if any(not e.get('issue') and not e.get('intent') for e in remaining) and sum(
-                        bool(e.get('issue') or e.get('intent')) for e in remaining) < jobs:
+                        bool(e.get('issue') or e.get('intent')) for e in remaining) + held < jobs:
                     continue
                 futures = list(running.values())
                 if futures:
